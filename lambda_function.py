@@ -6,261 +6,203 @@ import traceback
 from urllib.parse import unquote_plus
 from botocore.exceptions import ClientError
 from datetime import datetime
+import concurrent.futures
 
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
+# It's a good practice to initialize clients outside the handler
 s3_client = boto3.client('s3')
 bedrock_client = boto3.client("bedrock-runtime", region_name="eu-west-2")
-dynamodb_client = boto3.client('dynamodb', region_name='eu-west-2')
+dynamodb = boto3.resource('dynamodb', region_name='eu-west-2')
 
 # DynamoDB table configuration
 DYNAMODB_TABLE_NAME = "awslambdahackathoncarelogs"
+dynamodb_table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
 # Bedrock model configuration
 MODEL_ID = "amazon.titan-text-express-v1"
+
+# --- [MODIFIED] Helper function for parallel processing ---
+def process_record(args):
+    """
+    Wrapper function to classify a single record and handle potential errors.
+    This function is designed to be called by the ThreadPoolExecutor.
+    """
+    idx, visit_record, batch_id = args
+    try:
+        note_text = visit_record.get('note', '')
+        if not note_text.strip():
+            logger.warning(f"Record {idx} has an empty note, skipping classification.")
+            return None
+
+        classification_result = classify_visit_note(note_text)
+        
+        # Prepare the item for DynamoDB
+        item = {
+            'batch_id': batch_id,
+            'record_index': idx,
+            'ai_classification': classification_result,
+            'timestamp': datetime.now().isoformat(),
+            'client': str(visit_record.get('client', '')),
+            'care_pro': str(visit_record.get('care_pro', '')),
+            'visit_date': str(visit_record.get('visit_date', '')),
+            'note': note_text,
+        }
+        return item, classification_result
+    except Exception as e:
+        logger.error(f"Failed to process record {idx}. Error: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
 
 def classify_visit_note(note):
     """
     Classify a visit note using Amazon Bedrock.
     Returns: 'red', 'amber', or 'green'
     """
+    # This function remains largely the same but is now called concurrently.
     if not note or not note.strip():
         logger.warning("Empty note provided for classification")
-        return 'green'  # Default to green for empty notes
-    
-    # Define the classification prompt
+        return 'green'
+
     prompt = f"""You are a healthcare professional reviewing care visit notes. Please classify the following visit note into one of three categories based on the level of concern:
 
 RED: Urgent/critical issues requiring immediate attention (safety concerns, medical emergencies, serious incidents, safeguarding issues)
-AMBER: Moderate concerns that need follow-up (minor health changes, care plan adjustments needed, family concerns)  
+AMBER: Moderate concerns that need follow-up (minor health changes, care plan adjustments needed, family concerns)
 GREEN: Routine visit with no significant concerns (normal care delivery, positive outcomes, standard activities)
 
 Visit Note: "{note.strip()}"
 
 Classification (respond with only RED, AMBER, or GREEN):"""
 
-    # Format the request payload using Titan's native structure
     native_request = {
         "inputText": prompt,
         "textGenerationConfig": {
-            "maxTokenCount": 10,  # We only need a short response
-            "temperature": 0.1,   # Low temperature for consistent classification
+            "maxTokenCount": 10,
+            "temperature": 0.1,
         },
     }
-
-    # Convert the native request to JSON
     request = json.dumps(native_request)
 
     try:
-        # Invoke the model with the request
         response = bedrock_client.invoke_model(modelId=MODEL_ID, body=request)
-        
-        # Decode the response body
         model_response = json.loads(response["body"].read())
-        
-        # Extract the response text
         response_text = model_response["results"][0]["outputText"].strip().lower()
-        
-        # Map response to our classification system
+
         if 'red' in response_text:
-            classification = 'red'
+            return 'red'
         elif 'amber' in response_text:
-            classification = 'amber'
+            return 'amber'
         elif 'green' in response_text:
-            classification = 'green'
+            return 'green'
         else:
             logger.warning(f"Unexpected classification response: {response_text}, defaulting to amber")
-            classification = 'amber'  # Default to amber if unclear
-            
-        logger.debug(f"Bedrock classification result: {classification} (raw response: {response_text})")
-        return classification
-
+            return 'amber'
     except (ClientError, Exception) as e:
         logger.error(f"ERROR: Can't invoke Bedrock model '{MODEL_ID}'. Reason: {e}")
         logger.error(f"Classification error stack trace: {traceback.format_exc()}")
-        # Return amber as a safe default when classification fails
         return 'amber'
 
-def write_to_dynamodb(batch_id, record_index, visit_record, classification):
+# --- [NEW] Scalable function to write to DynamoDB in batches ---
+def batch_write_to_dynamodb(items_to_write):
     """
-    Write a classified visit log record to DynamoDB.
-    
-    Args:
-        batch_id (str): The batch ID
-        record_index (int): The record index within the batch (for unique key)
-        visit_record (dict): The visit log record data
-        classification (str): The AI classification result ('red', 'amber', 'green')
-    
-    Returns:
-        bool: True if successful, False otherwise
+    Writes a list of items to DynamoDB using a batch writer for efficiency.
     """
-    if not batch_id:
-        logger.error("Cannot write to DynamoDB: batch_id is required")
-        return False
+    if not items_to_write:
+        logger.info("No items to write to DynamoDB.")
+        return 0
     
     try:
-        # Prepare the item for DynamoDB
-        item = {
-            'batch_id': {'S': batch_id},  # Primary key (batch_id + record_index)
-            'record_index': {'N': str(record_index)},
-            'ai_classification': {'S': classification},
-            'timestamp': {'S': datetime.now().isoformat()},
-        }
-        
-        # Add visit record fields if they exist
-        if 'client' in visit_record:
-            item['client'] = {'S': str(visit_record['client'])}
-        if 'carer' in visit_record:
-            item['carer'] = {'S': str(visit_record['carer'])}
-        if 'date' in visit_record:
-            item['visit_date'] = {'S': str(visit_record['date'])}
-        if 'note' in visit_record:
-            item['note'] = {'S': str(visit_record['note'])}
-        if 'classification' in visit_record:
-            item['classification'] = {'S': str(visit_record['classification'])}
-        
-        # Write to DynamoDB
-        response = dynamodb_client.put_item(
-            TableName=DYNAMODB_TABLE_NAME,
-            Item=item
-        )
-        
-        logger.debug(f"Successfully wrote record {record_index} to DynamoDB")
-        return True
-        
+        with dynamodb_table.batch_writer() as batch:
+            for item in items_to_write:
+                batch.put_item(Item=item)
+        logger.info(f"Successfully wrote {len(items_to_write)} items to DynamoDB.")
+        return len(items_to_write)
     except ClientError as e:
-        logger.error(f"DynamoDB ClientError for record {record_index}: {e}")
+        logger.error(f"DynamoDB ClientError during batch write: {e}")
         logger.error(f"Error code: {e.response.get('Error', {}).get('Code', 'Unknown')}")
         logger.error(f"Error message: {e.response.get('Error', {}).get('Message', 'Unknown')}")
-        return False
+        return 0
     except Exception as e:
-        logger.error(f"Unexpected error writing record {record_index} to DynamoDB: {e}")
-        return False
+        logger.error(f"Unexpected error during batch write to DynamoDB: {e}")
+        return 0
 
+# --- [MODIFIED] Main Lambda handler for scalability ---
 def lambda_handler(event, context):
     """
-    AWS Lambda handler triggered by S3 object creation.
-    Expected S3 object key format: {batchId}.json (flat file structure)
+    AWS Lambda handler triggered by S3 object creation, optimized for parallel processing.
     """
-    
-    try:
-        # Process each S3 record in the event
-        for record in event['Records']:
-            bucket = record['s3']['bucket']['name']
-            key = unquote_plus(record['s3']['object']['key'])
+    for record in event['Records']:
+        bucket = record['s3']['bucket']['name']
+        key = unquote_plus(record['s3']['object']['key'])
+        
+        logger.info(f"Processing S3 object: s3://{bucket}/{key}")
+
+        try:
+            extracted_batch_id = os.path.splitext(key)[0]
+            logger.info(f"Extracted batch ID: {extracted_batch_id}")
             
-            logger.info(f"Processing S3 object: s3://{bucket}/{key}")
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            content = response['Body'].read().decode('utf-8')
+            records = json.loads(content)
+            record_count = len(records)
+            logger.info(f"Found {record_count} records to process in batch '{extracted_batch_id}'")
+
+            if not records:
+                logger.warning("No records found to classify.")
+                continue
+
+            # --- Parallel Processing using ThreadPoolExecutor ---
+            items_for_dynamodb = []
+            classification_counts = {'red': 0, 'amber': 0, 'green': 0}
             
-            # Extract batch ID from S3 object key
-            extracted_batch_id = None
-            original_filename = None
+            # Create a list of arguments for each record to be processed
+            tasks = [(idx, visit_record, extracted_batch_id) for idx, visit_record in enumerate(records)]
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                # map will apply the function to each item in tasks and return results in order
+                results = executor.map(process_record, tasks)
+
+            for result in results:
+                if result:
+                    item, classification = result
+                    items_for_dynamodb.append(item)
+                    classification_counts[classification] += 1
             
-            try:
-                # For flat file structure, the key is just the filename
-                original_filename = key
-                # Remove file extension to get batch ID
-                extracted_batch_id = os.path.splitext(original_filename)[0]
-                
-                logger.info(f"Extracted batch ID: {extracted_batch_id}")
-                    
-            except Exception as parse_ex:
-                logger.error(f"Could not parse batch ID from S3 key '{key}': {parse_ex}")
-                extracted_batch_id = None
+            processed_count = len(items_for_dynamodb)
             
-            # Download and read the JSON content from S3
-            try:
-                logger.info(f"Downloading S3 object content...")
-                response = s3_client.get_object(Bucket=bucket, Key=key)
-                content = response['Body'].read().decode('utf-8')
-                
-                # Parse JSON content
-                records = json.loads(content)
-                record_count = len(records)
-                logger.info(f"Found {record_count} records to process")
-                
-                # Log basic file information
-                logger.info(f"Batch ID: {extracted_batch_id}, Total Records: {record_count}")
-                
-                # Log sample record structure for debugging
-                if records:
-                    first_record = records[0]
-                    logger.info(f"Record structure - Keys: {list(first_record.keys())}")
-                    
-                    # Show a sample note
-                    if 'note' in first_record:
-                        note_preview = str(first_record['note'])[:100]
-                        logger.info(f"Sample note: '{note_preview}{'...' if len(str(first_record['note'])) > 100 else ''}'")
-                
-                # Process all records: classify and write to DynamoDB
-                if records and extracted_batch_id:
-                    logger.info("=== PROCESSING ALL RECORDS ===")
-                    
-                    success_count = 0
-                    classification_counts = {'red': 0, 'amber': 0, 'green': 0}
-                    
-                    for idx, visit_record in enumerate(records):
-                        note_text = visit_record.get('note', '')
-                        
-                        if note_text:
-                            # Classify the note
-                            classification_result = classify_visit_note(note_text)
-                            classification_counts[classification_result] += 1
-                            
-                            # Write to DynamoDB
-                            dynamodb_success = write_to_dynamodb(
-                                extracted_batch_id, 
-                                idx, 
-                                visit_record, 
-                                classification_result
-                            )
-                            
-                            if dynamodb_success:
-                                success_count += 1
-                            else:
-                                logger.error(f"Failed to write record {idx} to DynamoDB")
-                        else:
-                            logger.warning(f"Record {idx} has no 'note' field to classify")
-                    
-                    # Log summary statistics
-                    logger.info("=== PROCESSING SUMMARY ===")
-                    logger.info(f"✅ Successfully processed: {success_count}/{record_count} records")
-                    logger.info(f"🔴 Red classifications: {classification_counts['red']}")
-                    logger.info(f"🟡 Amber classifications: {classification_counts['amber']}")
-                    logger.info(f"🟢 Green classifications: {classification_counts['green']}")
-                    
-                    if success_count == record_count:
-                        logger.info("🎉 All records successfully classified and written to DynamoDB")
-                    else:
-                        logger.warning(f"⚠️  {record_count - success_count} records failed to process")
-                        
-                else:
-                    if not records:
-                        logger.warning("No records found to classify")
-                    if not extracted_batch_id:
-                        logger.warning("Cannot process records: No valid batch_id extracted")
-                
-                logger.info(f"Completed processing S3 object: s3://{bucket}/{key}")
-                
-            except json.JSONDecodeError as json_error:
-                logger.error(f"Failed to parse JSON content from S3 object: {json_error}")
-                raise
-            except Exception as s3_error:
-                logger.error(f"Failed to download or process S3 object: {s3_error}")
-                logger.error(f"S3 error stack trace: {traceback.format_exc()}")
-                raise
-                
-    except Exception as e:
-        logger.error(f"Lambda function failed: {str(e)}")
-        logger.error(f"Full error stack trace: {traceback.format_exc()}")
-        raise
-    
+            # --- Batch write to DynamoDB ---
+            success_count = batch_write_to_dynamodb(items_for_dynamodb)
+
+            # --- Log summary ---
+            logger.info("=== PROCESSING SUMMARY ===")
+            logger.info(f"✅ Successfully processed and saved: {success_count}/{record_count} records")
+            if processed_count != record_count:
+                 logger.warning(f"⚠️ {record_count - processed_count} records failed during classification step.")
+            if success_count < processed_count:
+                logger.error(f"❌ {processed_count - success_count} classified records failed to write to DynamoDB.")
+
+            logger.info(f"🔴 Red classifications: {classification_counts['red']}")
+            logger.info(f"🟡 Amber classifications: {classification_counts['amber']}")
+            logger.info(f"🟢 Green classifications: {classification_counts['green']}")
+
+        except json.JSONDecodeError as json_error:
+            logger.error(f"Failed to parse JSON from s3://{bucket}/{key}: {json_error}")
+            continue # Move to the next S3 record if any
+        except Exception as e:
+            logger.error(f"Lambda function failed for s3://{bucket}/{key}: {str(e)}")
+            logger.error(f"Full error stack trace: {traceback.format_exc()}")
+            # Depending on requirements, you might want to re-raise the exception
+            # to have the Lambda invocation marked as failed.
+            continue
+
     return {
         'statusCode': 200,
         'body': json.dumps({
-            'message': 'Successfully processed S3 trigger',
-            'processed_objects': len(event['Records'])
+            'message': 'Processing complete.',
+            'processed_objects': len(event.get('Records', []))
         })
     }
