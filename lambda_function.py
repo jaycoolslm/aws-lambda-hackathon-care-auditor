@@ -83,7 +83,7 @@ def lambda_handler(event, context):
                     logger.info(f"Record keys: {list(first_record.keys())}")
                     
                     # Log key field types and sample values
-                    for field_name in ['business_id', 'client', 'care_pro', 'visit_date', 'note', 'classification']:
+                    for field_name in ['client', 'carer', 'date', 'note', 'classification']:
                         if field_name in first_record:
                             value = first_record[field_name]
                             logger.info(f"{field_name}: {type(value).__name__} = '{str(value)[:100]}{'...' if len(str(value)) > 100 else ''}'")

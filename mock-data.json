@@ -1,0 +1,32 @@
+[
+  {
+    "client": "Evelyn Thompson",
+    "note": "Client appeared well and in good spirits. Assisted with breakfast and medication.",
+    "care_pro": "Sophie Lane",
+    "visit_date": "2025-06-11"
+  },
+  {
+    "client": "George Malik",
+    "note": "Noticed increased confusion today. Will monitor closely and inform supervisor.",
+    "care_pro": "Aaron D'Souza",
+    "visit_date": "2025-06-11"
+  },
+  {
+    "client": "Rita Johnson",
+    "note": "Client refused medication and food. Escalated to care coordinator.",
+    "care_pro": "Liam Chen",
+    "visit_date": "2025-06-10"
+  },
+  {
+    "client": "Michael Brook",
+    "note": "Client requested help with shower. No concerns noted.",
+    "care_pro": "Grace Patel",
+    "visit_date": "2025-06-09"
+  },
+  {
+    "client": "Nora Bell",
+    "note": "Complained of pain in left leg. Advised rest and will monitor tomorrow.",
+    "care_pro": "Emily Watson",
+    "visit_date": "2025-06-08"
+  }
+]
