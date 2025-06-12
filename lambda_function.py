@@ -4,13 +4,80 @@ import os
 import logging
 import traceback
 from urllib.parse import unquote_plus
+from botocore.exceptions import ClientError
 
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Initialize S3 client
+# Initialize AWS clients
 s3_client = boto3.client('s3')
+bedrock_client = boto3.client("bedrock-runtime", region_name="eu-west-2")
+
+# Bedrock model configuration
+MODEL_ID = "amazon.titan-text-express-v1"
+
+def classify_visit_note(note):
+    """
+    Classify a visit note using Amazon Bedrock.
+    Returns: 'red', 'amber', or 'green'
+    """
+    if not note or not note.strip():
+        logger.warning("Empty note provided for classification")
+        return 'green'  # Default to green for empty notes
+    
+    # Define the classification prompt
+    prompt = f"""You are a healthcare professional reviewing care visit notes. Please classify the following visit note into one of three categories based on the level of concern:
+
+RED: Urgent/critical issues requiring immediate attention (safety concerns, medical emergencies, serious incidents, safeguarding issues)
+AMBER: Moderate concerns that need follow-up (minor health changes, care plan adjustments needed, family concerns)  
+GREEN: Routine visit with no significant concerns (normal care delivery, positive outcomes, standard activities)
+
+Visit Note: "{note.strip()}"
+
+Classification (respond with only RED, AMBER, or GREEN):"""
+
+    # Format the request payload using Titan's native structure
+    native_request = {
+        "inputText": prompt,
+        "textGenerationConfig": {
+            "maxTokenCount": 10,  # We only need a short response
+            "temperature": 0.1,   # Low temperature for consistent classification
+        },
+    }
+
+    # Convert the native request to JSON
+    request = json.dumps(native_request)
+
+    try:
+        # Invoke the model with the request
+        response = bedrock_client.invoke_model(modelId=MODEL_ID, body=request)
+        
+        # Decode the response body
+        model_response = json.loads(response["body"].read())
+        
+        # Extract the response text
+        response_text = model_response["results"][0]["outputText"].strip().lower()
+        
+        # Map response to our classification system
+        if 'red' in response_text:
+            classification = 'red'
+        elif 'amber' in response_text:
+            classification = 'amber'
+        elif 'green' in response_text:
+            classification = 'green'
+        else:
+            logger.warning(f"Unexpected classification response: {response_text}, defaulting to amber")
+            classification = 'amber'  # Default to amber if unclear
+            
+        logger.info(f"Bedrock classification result: {classification} (raw response: {response_text})")
+        return classification
+
+    except (ClientError, Exception) as e:
+        logger.error(f"ERROR: Can't invoke Bedrock model '{MODEL_ID}'. Reason: {e}")
+        logger.error(f"Classification error stack trace: {traceback.format_exc()}")
+        # Return amber as a safe default when classification fails
+        return 'amber'
 
 def lambda_handler(event, context):
     """
@@ -89,6 +156,27 @@ def lambda_handler(event, context):
                             logger.info(f"{field_name}: {type(value).__name__} = '{str(value)[:100]}{'...' if len(str(value)) > 100 else ''}'")
                         else:
                             logger.info(f"{field_name}: NOT PRESENT")
+                
+                # NEW: Classify the first record using Bedrock
+                if records and len(records) > 0:
+                    logger.info("=== CLASSIFICATION TEST (FIRST RECORD) ===")
+                    first_record = records[0]
+                    note_text = first_record.get('note', '')
+                    
+                    if note_text:
+                        logger.info(f"Classifying note: '{note_text[:200]}{'...' if len(note_text) > 200 else ''}'")
+                        classification_result = classify_visit_note(note_text)
+                        logger.info(f"Classification result: {classification_result}")
+                        
+                        # Add classification to the record for logging
+                        first_record_with_classification = first_record.copy()
+                        first_record_with_classification['ai_classification'] = classification_result
+                        
+                        logger.info(f"First record with classification: {json.dumps(first_record_with_classification, indent=2)}")
+                    else:
+                        logger.warning("First record has no 'note' field to classify")
+                else:
+                    logger.warning("No records found to classify")
                 
                 logger.info("=== MVP PROCESSING COMPLETE ===")
                 logger.info(f"Successfully processed S3 object: s3://{bucket}/{key}")
