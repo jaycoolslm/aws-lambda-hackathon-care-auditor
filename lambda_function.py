@@ -75,7 +75,7 @@ Classification (respond with only RED, AMBER, or GREEN):"""
             logger.warning(f"Unexpected classification response: {response_text}, defaulting to amber")
             classification = 'amber'  # Default to amber if unclear
             
-        logger.info(f"Bedrock classification result: {classification} (raw response: {response_text})")
+        logger.debug(f"Bedrock classification result: {classification} (raw response: {response_text})")
         return classification
 
     except (ClientError, Exception) as e:
@@ -84,12 +84,13 @@ Classification (respond with only RED, AMBER, or GREEN):"""
         # Return amber as a safe default when classification fails
         return 'amber'
 
-def write_to_dynamodb(batch_id, visit_record, classification):
+def write_to_dynamodb(batch_id, record_index, visit_record, classification):
     """
     Write a classified visit log record to DynamoDB.
     
     Args:
-        batch_id (str): The batch ID to use as primary key
+        batch_id (str): The batch ID
+        record_index (int): The record index within the batch (for unique key)
         visit_record (dict): The visit log record data
         classification (str): The AI classification result ('red', 'amber', 'green')
     
@@ -103,9 +104,10 @@ def write_to_dynamodb(batch_id, visit_record, classification):
     try:
         # Prepare the item for DynamoDB
         item = {
-            'batch_id': {'S': str(batch_id)},  # Primary key
+            'batch_id': {'S': batch_id},  # Primary key (batch_id + record_index)
+            'record_index': {'N': str(record_index)},
             'ai_classification': {'S': classification},
-            'timestamp': {'S': json.dumps(datetime.now().isoformat())},
+            'timestamp': {'S': datetime.now().isoformat()},
         }
         
         # Add visit record fields if they exist
@@ -121,25 +123,21 @@ def write_to_dynamodb(batch_id, visit_record, classification):
             item['classification'] = {'S': str(visit_record['classification'])}
         
         # Write to DynamoDB
-        logger.info(f"Writing classified record to DynamoDB table: {DYNAMODB_TABLE_NAME}")
-        logger.info(f"Item batch_id: {batch_id}, classification: {classification}")
-        
         response = dynamodb_client.put_item(
             TableName=DYNAMODB_TABLE_NAME,
             Item=item
         )
         
-        logger.info(f"Successfully wrote record to DynamoDB. ResponseMetadata: {response.get('ResponseMetadata', {})}")
+        logger.debug(f"Successfully wrote record {record_index} to DynamoDB")
         return True
         
     except ClientError as e:
-        logger.error(f"DynamoDB ClientError: {e}")
+        logger.error(f"DynamoDB ClientError for record {record_index}: {e}")
         logger.error(f"Error code: {e.response.get('Error', {}).get('Code', 'Unknown')}")
         logger.error(f"Error message: {e.response.get('Error', {}).get('Message', 'Unknown')}")
         return False
     except Exception as e:
-        logger.error(f"Unexpected error writing to DynamoDB: {e}")
-        logger.error(f"DynamoDB write error stack trace: {traceback.format_exc()}")
+        logger.error(f"Unexpected error writing record {record_index} to DynamoDB: {e}")
         return False
 
 def lambda_handler(event, context):
@@ -156,7 +154,7 @@ def lambda_handler(event, context):
             
             logger.info(f"Processing S3 object: s3://{bucket}/{key}")
             
-            # Extract batch ID from S3 object key (simplified - filename is the batch ID)
+            # Extract batch ID from S3 object key
             extracted_batch_id = None
             original_filename = None
             
@@ -166,11 +164,10 @@ def lambda_handler(event, context):
                 # Remove file extension to get batch ID
                 extracted_batch_id = os.path.splitext(original_filename)[0]
                 
-                logger.info(f"Successfully parsed S3 key - Batch ID: {extracted_batch_id}, File: {original_filename}")
+                logger.info(f"Extracted batch ID: {extracted_batch_id}")
                     
             except Exception as parse_ex:
                 logger.error(f"Could not parse batch ID from S3 key '{key}': {parse_ex}")
-                logger.error(f"Parse error stack trace: {traceback.format_exc()}")
                 extracted_batch_id = None
             
             # Download and read the JSON content from S3
@@ -182,75 +179,70 @@ def lambda_handler(event, context):
                 # Parse JSON content
                 records = json.loads(content)
                 record_count = len(records)
-                logger.info(f"Successfully parsed S3 object content. Found {record_count} records to process.")
+                logger.info(f"Found {record_count} records to process")
                 
-                # Log extracted information (MVP - just console logging)
-                logger.info("=== EXTRACTED INFORMATION ===")
-                logger.info(f"S3 Bucket: {bucket}")
-                logger.info(f"S3 Key: {key}")
-                logger.info(f"Batch ID: {extracted_batch_id}")
-                logger.info(f"Original Filename: {original_filename}")
-                logger.info(f"Total Records: {record_count}")
+                # Log basic file information
+                logger.info(f"Batch ID: {extracted_batch_id}, Total Records: {record_count}")
                 
-                # Log sample records for debugging (first 3 records)
-                logger.info("=== SAMPLE RECORDS ===")
-                sample_records = records[:3] if len(records) >= 3 else records
-                for idx, sample_record in enumerate(sample_records):
-                    logger.info(f"Record {idx + 1}: {json.dumps(sample_record, indent=2)}")
-                
-                if len(records) > 3:
-                    logger.info(f"... and {len(records) - 3} more records")
-                
-                # Log record structure analysis
+                # Log sample record structure for debugging
                 if records:
                     first_record = records[0]
-                    logger.info("=== RECORD STRUCTURE ANALYSIS ===")
-                    logger.info(f"Record keys: {list(first_record.keys())}")
+                    logger.info(f"Record structure - Keys: {list(first_record.keys())}")
                     
-                    # Log key field types and sample values
-                    for field_name in ['client', 'carer', 'date', 'note', 'classification']:
-                        if field_name in first_record:
-                            value = first_record[field_name]
-                            logger.info(f"{field_name}: {type(value).__name__} = '{str(value)[:100]}{'...' if len(str(value)) > 100 else ''}'")
-                        else:
-                            logger.info(f"{field_name}: NOT PRESENT")
+                    # Show a sample note
+                    if 'note' in first_record:
+                        note_preview = str(first_record['note'])[:100]
+                        logger.info(f"Sample note: '{note_preview}{'...' if len(str(first_record['note'])) > 100 else ''}'")
                 
-                # NEW: Classify the first record using Bedrock and write to DynamoDB
-                if records and len(records) > 0:
-                    logger.info("=== CLASSIFICATION AND DYNAMODB WRITE (FIRST RECORD) ===")
-                    first_record = records[0]
-                    note_text = first_record.get('note', '')
+                # Process all records: classify and write to DynamoDB
+                if records and extracted_batch_id:
+                    logger.info("=== PROCESSING ALL RECORDS ===")
                     
-                    if note_text:
-                        logger.info(f"Classifying note: '{note_text[:200]}{'...' if len(note_text) > 200 else ''}'")
-                        classification_result = classify_visit_note(note_text)
-                        logger.info(f"Classification result: {classification_result}")
+                    success_count = 0
+                    classification_counts = {'red': 0, 'amber': 0, 'green': 0}
+                    
+                    for idx, visit_record in enumerate(records):
+                        note_text = visit_record.get('note', '')
                         
-                        # Add classification to the record for logging
-                        first_record_with_classification = first_record.copy()
-                        first_record_with_classification['ai_classification'] = classification_result
-                        
-                        logger.info(f"First record with classification: {json.dumps(first_record_with_classification, indent=2)}")
-                        
-                        # Write classified record to DynamoDB
-                        if extracted_batch_id:
-                            logger.info("=== WRITING TO DYNAMODB ===")
-                            dynamodb_success = write_to_dynamodb(extracted_batch_id, first_record, classification_result)
+                        if note_text:
+                            # Classify the note
+                            classification_result = classify_visit_note(note_text)
+                            classification_counts[classification_result] += 1
+                            
+                            # Write to DynamoDB
+                            dynamodb_success = write_to_dynamodb(
+                                extracted_batch_id, 
+                                idx, 
+                                visit_record, 
+                                classification_result
+                            )
                             
                             if dynamodb_success:
-                                logger.info("✅ Successfully wrote classified record to DynamoDB")
+                                success_count += 1
                             else:
-                                logger.error("❌ Failed to write classified record to DynamoDB")
+                                logger.error(f"Failed to write record {idx} to DynamoDB")
                         else:
-                            logger.warning("⚠️  Cannot write to DynamoDB: No valid batch_id extracted")
-                            
+                            logger.warning(f"Record {idx} has no 'note' field to classify")
+                    
+                    # Log summary statistics
+                    logger.info("=== PROCESSING SUMMARY ===")
+                    logger.info(f"✅ Successfully processed: {success_count}/{record_count} records")
+                    logger.info(f"🔴 Red classifications: {classification_counts['red']}")
+                    logger.info(f"🟡 Amber classifications: {classification_counts['amber']}")
+                    logger.info(f"🟢 Green classifications: {classification_counts['green']}")
+                    
+                    if success_count == record_count:
+                        logger.info("🎉 All records successfully classified and written to DynamoDB")
                     else:
-                        logger.warning("First record has no 'note' field to classify")
+                        logger.warning(f"⚠️  {record_count - success_count} records failed to process")
+                        
                 else:
-                    logger.warning("No records found to classify")
+                    if not records:
+                        logger.warning("No records found to classify")
+                    if not extracted_batch_id:
+                        logger.warning("Cannot process records: No valid batch_id extracted")
                 
-                logger.info("=== MVP PROCESSING COMPLETE ===")
-                logger.info(f"Successfully processed S3 object: s3://{bucket}/{key}")
+                logger.info(f"Completed processing S3 object: s3://{bucket}/{key}")
                 
             except json.JSONDecodeError as json_error:
                 logger.error(f"Failed to parse JSON content from S3 object: {json_error}")
