@@ -42,8 +42,8 @@ def process_record(args):
         
         # Prepare the item for DynamoDB
         item = {
-            'batch_id': batch_id,
-            'record_index': idx,
+            'id': idx,  # Partition key
+            'batch_id': batch_id,  # Sort key
             'ai_classification': classification_result,
             'timestamp': datetime.now().isoformat(),
             'client': str(visit_record.get('client', '')),
