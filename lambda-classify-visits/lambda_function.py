@@ -133,71 +133,82 @@ def batch_write_to_dynamodb(items_to_write):
 # --- [MODIFIED] Main Lambda handler for scalability ---
 def lambda_handler(event, context):
     """
-    AWS Lambda handler triggered by S3 object creation, optimized for parallel processing.
+    AWS Lambda handler triggered by SNS notifications containing S3 events, optimized for parallel processing.
     """
+    logger.info("Received event: " + json.dumps(event))
+    
     for record in event['Records']:
-        bucket = record['s3']['bucket']['name']
-        key = unquote_plus(record['s3']['object']['key'])
-        
-        logger.info(f"Processing S3 object: s3://{bucket}/{key}")
-
-        try:
-            extracted_batch_id = os.path.splitext(key)[0]
-            logger.info(f"Extracted batch ID: {extracted_batch_id}")
+        # Extract the SNS message
+        if 'Sns' in record:
+            # Parse the SNS message which contains the S3 event
+            sns_message = json.loads(record['Sns']['Message'])
             
-            response = s3_client.get_object(Bucket=bucket, Key=key)
-            content = response['Body'].read().decode('utf-8')
-            records = json.loads(content)
-            record_count = len(records)
-            logger.info(f"Found {record_count} records to process in batch '{extracted_batch_id}'")
+            # Process each S3 record in the SNS message
+            for s3_record in sns_message['Records']:
+                bucket = s3_record['s3']['bucket']['name']
+                key = unquote_plus(s3_record['s3']['object']['key'])
+                
+                logger.info(f"Processing S3 object: s3://{bucket}/{key}")
 
-            if not records:
-                logger.warning("No records found to classify.")
-                continue
+                try:
+                    extracted_batch_id = os.path.splitext(key)[0]
+                    logger.info(f"Extracted batch ID: {extracted_batch_id}")
+                    
+                    response = s3_client.get_object(Bucket=bucket, Key=key)
+                    content = response['Body'].read().decode('utf-8')
+                    records = json.loads(content)
+                    record_count = len(records)
+                    logger.info(f"Found {record_count} records to process in batch '{extracted_batch_id}'")
 
-            # --- Parallel Processing using ThreadPoolExecutor ---
-            items_for_dynamodb = []
-            classification_counts = {'red': 0, 'amber': 0, 'green': 0}
-            
-            # Create a list of arguments for each record to be processed
-            tasks = [(idx, visit_record, extracted_batch_id) for idx, visit_record in enumerate(records)]
+                    if not records:
+                        logger.warning("No records found to classify.")
+                        continue
 
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                # map will apply the function to each item in tasks and return results in order
-                results = executor.map(process_record, tasks)
+                    # --- Parallel Processing using ThreadPoolExecutor ---
+                    items_for_dynamodb = []
+                    classification_counts = {'red': 0, 'amber': 0, 'green': 0}
+                    
+                    # Create a list of arguments for each record to be processed
+                    tasks = [(idx, visit_record, extracted_batch_id) for idx, visit_record in enumerate(records)]
 
-            for result in results:
-                if result:
-                    item, classification = result
-                    items_for_dynamodb.append(item)
-                    classification_counts[classification] += 1
-            
-            processed_count = len(items_for_dynamodb)
-            
-            # --- Batch write to DynamoDB ---
-            success_count = batch_write_to_dynamodb(items_for_dynamodb)
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        # map will apply the function to each item in tasks and return results in order
+                        results = executor.map(process_record, tasks)
 
-            # --- Log summary ---
-            logger.info("=== PROCESSING SUMMARY ===")
-            logger.info(f"✅ Successfully processed and saved: {success_count}/{record_count} records")
-            if processed_count != record_count:
-                 logger.warning(f"⚠️ {record_count - processed_count} records failed during classification step.")
-            if success_count < processed_count:
-                logger.error(f"❌ {processed_count - success_count} classified records failed to write to DynamoDB.")
+                    for result in results:
+                        if result:
+                            item, classification = result
+                            items_for_dynamodb.append(item)
+                            classification_counts[classification] += 1
+                    
+                    processed_count = len(items_for_dynamodb)
+                    
+                    # --- Batch write to DynamoDB ---
+                    success_count = batch_write_to_dynamodb(items_for_dynamodb)
 
-            logger.info(f"🔴 Red classifications: {classification_counts['red']}")
-            logger.info(f"🟡 Amber classifications: {classification_counts['amber']}")
-            logger.info(f"🟢 Green classifications: {classification_counts['green']}")
+                    # --- Log summary ---
+                    logger.info("=== PROCESSING SUMMARY ===")
+                    logger.info(f"✅ Successfully processed and saved: {success_count}/{record_count} records")
+                    if processed_count != record_count:
+                         logger.warning(f"⚠️ {record_count - processed_count} records failed during classification step.")
+                    if success_count < processed_count:
+                        logger.error(f"❌ {processed_count - success_count} classified records failed to write to DynamoDB.")
 
-        except json.JSONDecodeError as json_error:
-            logger.error(f"Failed to parse JSON from s3://{bucket}/{key}: {json_error}")
-            continue # Move to the next S3 record if any
-        except Exception as e:
-            logger.error(f"Lambda function failed for s3://{bucket}/{key}: {str(e)}")
-            logger.error(f"Full error stack trace: {traceback.format_exc()}")
-            # Depending on requirements, you might want to re-raise the exception
-            # to have the Lambda invocation marked as failed.
-            continue
+                    logger.info(f"🔴 Red classifications: {classification_counts['red']}")
+                    logger.info(f"🟡 Amber classifications: {classification_counts['amber']}")
+                    logger.info(f"🟢 Green classifications: {classification_counts['green']}")
+
+                except json.JSONDecodeError as json_error:
+                    logger.error(f"Failed to parse JSON from s3://{bucket}/{key}: {json_error}")
+                    continue # Move to the next S3 record if any
+                except Exception as e:
+                    logger.error(f"Lambda function failed for s3://{bucket}/{key}: {str(e)}")
+                    logger.error(f"Full error stack trace: {traceback.format_exc()}")
+                    # Depending on requirements, you might want to re-raise the exception
+                    # to have the Lambda invocation marked as failed.
+                    continue
+        else:
+            logger.warning("Record doesn't contain SNS message")
 
     return {
         'statusCode': 200,

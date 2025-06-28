@@ -117,53 +117,64 @@ def batch_write_to_dynamodb(items_to_write):
 # Lambda handler
 
 def lambda_handler(event, context):
-    """Triggered by S3 object creation. Groups visit logs per client and summarises them."""
+    """Triggered by SNS notifications containing S3 events. Groups visit logs per client and summarises them."""
+    logger.info("Received event: " + json.dumps(event))
+    
     for record in event.get("Records", []):
-        bucket = record["s3"]["bucket"]["name"]
-        key = unquote_plus(record["s3"]["object"]["key"])
-        logger.info(f"Processing S3 object for summarisation: s3://{bucket}/{key}")
+        # Extract the SNS message
+        if 'Sns' in record:
+            # Parse the SNS message which contains the S3 event
+            sns_message = json.loads(record['Sns']['Message'])
+            
+            # Process each S3 record in the SNS message
+            for s3_record in sns_message['Records']:
+                bucket = s3_record["s3"]["bucket"]["name"]
+                key = unquote_plus(s3_record["s3"]["object"]["key"])
+                logger.info(f"Processing S3 object for summarisation: s3://{bucket}/{key}")
 
-        try:
-            batch_id = os.path.splitext(key)[0]
-            logger.info(f"Extracted batch ID for summarisation: {batch_id}")
+                try:
+                    batch_id = os.path.splitext(key)[0]
+                    logger.info(f"Extracted batch ID for summarisation: {batch_id}")
 
-            response = s3_client.get_object(Bucket=bucket, Key=key)
-            content = response["Body"].read().decode("utf-8")
-            visit_records = json.loads(content)
-            logger.info(f"Loaded {len(visit_records)} visit records for summarisation.")
+                    response = s3_client.get_object(Bucket=bucket, Key=key)
+                    content = response["Body"].read().decode("utf-8")
+                    visit_records = json.loads(content)
+                    logger.info(f"Loaded {len(visit_records)} visit records for summarisation.")
 
-            # Group records by client
-            client_map = {}
-            for rec in visit_records:
-                client = rec.get("client", "Unknown")
-                client_map.setdefault(client, []).append(rec)
+                    # Group records by client
+                    client_map = {}
+                    for rec in visit_records:
+                        client = rec.get("client", "Unknown")
+                        client_map.setdefault(client, []).append(rec)
 
-            # Prepare tasks for parallel processing
-            tasks = [
-                (idx, client_name, records, batch_id)
-                for idx, (client_name, records) in enumerate(client_map.items())
-            ]
+                    # Prepare tasks for parallel processing
+                    tasks = [
+                        (idx, client_name, records, batch_id)
+                        for idx, (client_name, records) in enumerate(client_map.items())
+                    ]
 
-            items_for_dynamodb = []
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                results = executor.map(process_client, tasks)
+                    items_for_dynamodb = []
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        results = executor.map(process_client, tasks)
 
-            for item in results:
-                if item:
-                    items_for_dynamodb.append(item)
+                    for item in results:
+                        if item:
+                            items_for_dynamodb.append(item)
 
-            processed_count = len(items_for_dynamodb)
-            success_count = batch_write_to_dynamodb(items_for_dynamodb)
+                    processed_count = len(items_for_dynamodb)
+                    success_count = batch_write_to_dynamodb(items_for_dynamodb)
 
-            logger.info("=== SUMMARY PROCESSING COMPLETE ===")
-            logger.info(f"✅ Summarised {processed_count} clients and wrote {success_count} items to DynamoDB.")
-        except json.JSONDecodeError as json_error:
-            logger.error(f"Failed to parse JSON from s3://{bucket}/{key}: {json_error}")
-            continue
-        except Exception as e:
-            logger.error(f"Summarisation Lambda failed for s3://{bucket}/{key}: {str(e)}")
-            logger.error(traceback.format_exc())
-            continue
+                    logger.info("=== SUMMARY PROCESSING COMPLETE ===")
+                    logger.info(f"✅ Summarised {processed_count} clients and wrote {success_count} items to DynamoDB.")
+                except json.JSONDecodeError as json_error:
+                    logger.error(f"Failed to parse JSON from s3://{bucket}/{key}: {json_error}")
+                    continue
+                except Exception as e:
+                    logger.error(f"Summarisation Lambda failed for s3://{bucket}/{key}: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    continue
+        else:
+            logger.warning("Record doesn't contain SNS message")
 
     return {
         "statusCode": 200,
