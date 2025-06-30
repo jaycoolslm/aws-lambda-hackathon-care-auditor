@@ -35,5 +35,4 @@ Inside each Lambda a `ThreadPoolExecutor` processes many notes concurrently, whi
 ## Repo & Demo
 
 • Public repo: <https://github.com/jaycoolslm/aws-lambda-hackathon-care-auditor>  
-• Demo video (3 min): <https://www.youtube.com/watch?v=YOUR_VIDEO_ID>  
-• Full write-up: <https://devpost.com/your-submission>
+• Demo video: <https://vimeo.com/1097499489/3cb742a3ca?ts=86970&share=copy>
